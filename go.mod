@@ -16,3 +16,7 @@ require (
 	golang.org/x/crypto v0.0.0-20190404164418-38d8ce5564a5 // indirect
 	golang.org/x/net v0.0.0-20190404232315-eb5bcb51f2a3
 )
+
+replace (
+  github.com/pierrec/lz4 => github.com/CiscoM31/lz4 master
+)
