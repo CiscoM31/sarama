@@ -7,7 +7,7 @@ import (
 	"sync"
 
 	"github.com/eapache/go-xerial-snappy"
-	"github.com/CiscoM31/lz4"
+	"github.com/pierrec/lz4"
 )
 
 var (
