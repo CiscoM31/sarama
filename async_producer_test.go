@@ -9,6 +9,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/fortytw2/leaktest"
+	metrics "github.com/rcrowley/go-metrics"
 )
 
 const TestMessage = "ABC THE MESSAGE"
@@ -309,7 +312,6 @@ func TestAsyncProducerFailureRetry(t *testing.T) {
 }
 
 func TestAsyncProducerRecoveryWithRetriesDisabled(t *testing.T) {
-
 	tt := func(t *testing.T, kErr KError) {
 		seedBroker := NewMockBroker(t, 1)
 		leader1 := NewMockBroker(t, 2)
@@ -331,7 +333,6 @@ func TestAsyncProducerRecoveryWithRetriesDisabled(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		seedBroker.Close()
 
 		producer.Input() <- &ProducerMessage{Topic: "my_topic", Key: nil, Value: StringEncoder(TestMessage), Partition: 0}
 		producer.Input() <- &ProducerMessage{Topic: "my_topic", Key: nil, Value: StringEncoder(TestMessage), Partition: 1}
@@ -356,6 +357,7 @@ func TestAsyncProducerRecoveryWithRetriesDisabled(t *testing.T) {
 		leader2.Returns(prodSuccess)
 		expectResults(t, producer, 2, 0)
 
+		seedBroker.Close()
 		leader1.Close()
 		leader2.Close()
 		closeProducer(t, producer)
@@ -986,7 +988,7 @@ func TestAsyncProducerIdempotentRetryCheckBatch(t *testing.T) {
 		lastBatchFirstSeq := -1
 		lastBatchSize := -1
 		lastSequenceWrittenToDisk := -1
-		handlerFailBeforeWrite := func(req *request) (res encoder) {
+		handlerFailBeforeWrite := func(req *request) (res encoderWithHeader) {
 			switch req.body.key() {
 			case 3:
 				return metadataResponse
@@ -1126,6 +1128,106 @@ func TestAsyncProducerIdempotentErrorOnOutOfSeq(t *testing.T) {
 
 	broker.Close()
 	closeProducer(t, producer)
+}
+
+func TestAsyncProducerIdempotentEpochRollover(t *testing.T) {
+	broker := NewMockBroker(t, 1)
+	defer broker.Close()
+
+	metadataResponse := &MetadataResponse{
+		Version:      1,
+		ControllerID: 1,
+	}
+	metadataResponse.AddBroker(broker.Addr(), broker.BrokerID())
+	metadataResponse.AddTopicPartition("my_topic", 0, broker.BrokerID(), nil, nil, nil, ErrNoError)
+	broker.Returns(metadataResponse)
+
+	initProducerID := &InitProducerIDResponse{
+		ThrottleTime:  0,
+		ProducerID:    1000,
+		ProducerEpoch: 1,
+	}
+	broker.Returns(initProducerID)
+
+	config := NewConfig()
+	config.Producer.Flush.Messages = 10
+	config.Producer.Flush.Frequency = 10 * time.Millisecond
+	config.Producer.Return.Successes = true
+	config.Producer.Retry.Max = 1 // This test needs to exercise what happens when retries exhaust
+	config.Producer.RequiredAcks = WaitForAll
+	config.Producer.Retry.Backoff = 0
+	config.Producer.Idempotent = true
+	config.Net.MaxOpenRequests = 1
+	config.Version = V0_11_0_0
+
+	producer, err := NewAsyncProducer([]string{broker.Addr()}, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeProducer(t, producer)
+
+	producer.Input() <- &ProducerMessage{Topic: "my_topic", Value: StringEncoder("hello")}
+	prodError := &ProduceResponse{
+		Version:      3,
+		ThrottleTime: 0,
+	}
+	prodError.AddTopicPartition("my_topic", 0, ErrBrokerNotAvailable)
+	broker.Returns(prodError)
+	<-producer.Errors()
+
+	lastReqRes := broker.history[len(broker.history)-1]
+	lastProduceBatch := lastReqRes.Request.(*ProduceRequest).records["my_topic"][0].RecordBatch
+	if lastProduceBatch.FirstSequence != 0 {
+		t.Error("first sequence not zero")
+	}
+	if lastProduceBatch.ProducerEpoch != 1 {
+		t.Error("first epoch was not one")
+	}
+
+	// Now if we produce again, the epoch should have rolled over.
+	producer.Input() <- &ProducerMessage{Topic: "my_topic", Value: StringEncoder("hello")}
+	broker.Returns(prodError)
+	<-producer.Errors()
+
+	lastReqRes = broker.history[len(broker.history)-1]
+	lastProduceBatch = lastReqRes.Request.(*ProduceRequest).records["my_topic"][0].RecordBatch
+	if lastProduceBatch.FirstSequence != 0 {
+		t.Error("second sequence not zero")
+	}
+	if lastProduceBatch.ProducerEpoch <= 1 {
+		t.Error("second epoch was not > 1")
+	}
+}
+
+// TestBrokerProducerShutdown ensures that a call to shutdown stops the
+// brokerProducer run() loop and doesn't leak any goroutines
+func TestBrokerProducerShutdown(t *testing.T) {
+	defer leaktest.Check(t)()
+	metrics.UseNilMetrics = true // disable Sarama's go-metrics library
+	defer func() {
+		metrics.UseNilMetrics = false
+	}()
+
+	mockBroker := NewMockBroker(t, 1)
+	metadataResponse := &MetadataResponse{}
+	metadataResponse.AddBroker(mockBroker.Addr(), mockBroker.BrokerID())
+	metadataResponse.AddTopicPartition(
+		"my_topic", 0, mockBroker.BrokerID(), nil, nil, nil, ErrNoError)
+	mockBroker.Returns(metadataResponse)
+
+	producer, err := NewAsyncProducer([]string{mockBroker.Addr()}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker := &Broker{
+		addr: mockBroker.Addr(),
+		id:   mockBroker.BrokerID(),
+	}
+	bp := producer.(*asyncProducer).newBrokerProducer(broker)
+
+	bp.shutdown()
+	_ = producer.Close()
+	mockBroker.Close()
 }
 
 // This example shows how to use the producer while simultaneously
