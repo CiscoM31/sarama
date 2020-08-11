@@ -32,3 +32,7 @@ require (
 	gopkg.in/jcmturner/rpc.v1 v1.1.0 // indirect
 	gopkg.in/yaml.v2 v2.2.8 // indirect
 )
+
+replace (
+  github.com/pierrec/lz4 => github.com/CiscoM31/lz4 master
+)
